@@ -40,6 +40,12 @@ class SystemLogger(logging.getLoggerClass()):
     service_id = service_state["id"].int
 
     @classmethod
+    def set_event(cls, current_event: uuid.UUID):
+        cls.global_log_context["event"] = getattr(
+            current_event, "hex", current_event
+        )
+
+    @classmethod
     def _convert_safe_msg(cls, msg: str, wrap: bool = True) -> str:
         """Message in safe format to use as value in JSON.
         """
