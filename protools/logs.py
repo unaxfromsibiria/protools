@@ -193,9 +193,9 @@ def setup_logger(
     logging.setLoggerClass(SystemLogger)
     debug = env_var_bool("DEBUG")
     if debug:
-        level = env_var_line("LOGLEVEL").upper()
-    else:
         level = "DEBUG"
+    else:
+        level = env_var_line("LOGLEVEL").upper()
 
     formatter, file_open_err = get_formatter_line()
     fields = re.findall(r"[(]\w+[)][\w.]+", formatter)
@@ -222,12 +222,14 @@ def setup_logger(
 
         extra_fields[field_name] = default_value
 
+    level = getattr(logging, level, logging.INFO)
     SystemLogger.extra_fields = extra_fields
     formatter = logging.Formatter(formatter)
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, level, logging.INFO))
+    logger.setLevel(level)
     if not handler:
         handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(level)
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -237,6 +239,7 @@ def setup_logger(
             file_open_err,
             extra={"sys": f"{SYSTEM_NAME}.init"}
         )
+
 
 
 if env_var_bool("IMPORT_LOGGER_SETUP"):
