@@ -3,3 +3,4 @@ ipdb
 pytest
 pytest-cov
 pytest-sugar
+pytest-aiohttp

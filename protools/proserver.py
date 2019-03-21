@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 from collections import defaultdict
 from collections.abc import Callable
@@ -54,23 +55,26 @@ class ApiHandler:
         status_code = web.HTTPOk.status_code
         error = None
         answer = None
+        event = None
         try:
             data = await request.json()
             request_id = data.get("id")
-            if request_id and isinstance(request_id, int):
-                event = UUID(f"{request_id:032x}")
+            if request_id:
+                if isinstance(request_id, int):
+                    request_id = f"{request_id:032x}"
+
+                event = UUID(request_id)
             else:
                 event = get_time_uuid()
 
             self.logger.set_event(event)
-
         except Exception as err:
             self.logger.error("Bad request: %s", err)
-            status_code = web.HTTPServerError.status_code
+            status_code = web.HTTPBadRequest.status_code
             error = f"{err}"
         else:
             method_name = data.get("method")
-            if method_name:
+            if method_name and isinstance(method_name, str):
                 params = data.get("params") or {}
                 if isinstance(params, dict):
                     if self._server_state.get("active"):
@@ -96,7 +100,7 @@ class ApiHandler:
                     error = "Unsupported type of 'params'"
             else:
                 status_code = web.HTTPBadRequest.status_code
-                error = "Incorrect JSON-RPC request (not exist method)"
+                error = "Incorrect JSON-RPC request (wrong name of method)"
 
             # TODO: JWT for params? (need token auth)
 
@@ -106,16 +110,21 @@ class ApiHandler:
         # TODO: check result and call next method
         # TODO: big result and params save to redis (have to transfer without message broker)
 
-        resp = {
-            "id": event.int if self.id_as_int else event.hex,
-            "jsonrpc": "2.0",
-        }
+        resp = {"jsonrpc": "2.0"}
+        if event:
+            resp["id"] = event.int if self.id_as_int else event.hex
+
         if answer:
             resp["result"] = answer
         else:
             resp["error"] = {"code": status_code, "message": error}
 
-        return web.json_response(resp, status=status_code, dumps=ujson.dumps)
+        return web.json_response(
+            resp,
+            status=status_code,
+            # ujson has problems with 128 bit int values
+            dumps=json.dumps if self.id_as_int else ujson.dumps
+        )
 
 
 class ProcessingServer:
