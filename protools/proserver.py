@@ -20,6 +20,8 @@ from .helpers import env_var_int
 from .helpers import env_var_line
 from .helpers import get_time_uuid
 from .logs import SYSTEM_NAME
+from .options import REG_METHOD_NAME
+from .options import STOP_METHOD_NAME
 
 
 class ApiHandler:
@@ -104,10 +106,6 @@ class ApiHandler:
 
             # TODO: JWT for params? (need token auth)
 
-        # TODO: check method in registr
-        # TODO: registr for methods and workers
-        # TODO: rpc call
-        # TODO: check result and call next method
         # TODO: big result and params save to redis (have to transfer without message broker)
 
         resp = {"jsonrpc": "2.0"}
@@ -140,7 +138,7 @@ class ProcessingServer:
     methods = None
     free_workers = None
     state = None
-    next_call_queue = None
+    _next_call_queue = None
 
     def __init__(self, logger: object):
         self.options = {
@@ -174,7 +172,7 @@ class ProcessingServer:
         self.wait_free_timeout = env_var_float("METHOD_WAIT_TIME") or 5.0
         self.iter_delay = env_var_float("DEFAULT_ITER_DELAY") or 0.025
         self.support_iter_delay = env_var_float("SUPPORT_ITER_DELAY") or 10.0
-        self.next_call_queue = asyncio.Queue()
+        self._next_call_queue = asyncio.Queue()
 
     def __str__(self) -> str:
         options = ",".join(
@@ -219,7 +217,11 @@ class ProcessingServer:
                 # show inner statistic
                 self.logger.debug(
                     "Current input stream",
-                    extra={"count": input_stream, "start_time": start_time}
+                    extra={
+                        "count": input_stream,
+                        "start_time": start_time,
+                        "sys": f"{SYSTEM_NAME}.statistic"
+                    }
                 )
 
         self.logger.info("Stopping manager..")
@@ -286,8 +288,12 @@ class ProcessingServer:
             channel = await connection.channel()
             rpc = await RPC.create(channel)
             self.client = rpc
-            await rpc.register("reg_worker", self.reg_worker, auto_delete=True)
-            await rpc.register("stop", self.stop_server, auto_delete=True)
+            await rpc.register(
+                REG_METHOD_NAME, self.reg_worker, auto_delete=True
+            )
+            await rpc.register(
+                STOP_METHOD_NAME, self.stop_server, auto_delete=True
+            )
             await self.wait_inner_call()
 
         self.logger.info("Broker processing spopping")
@@ -296,7 +302,7 @@ class ProcessingServer:
         """Polling of queue for next method call.
         """
         while self.state.get("active"):
-            inner_method_call = await self.next_call_queue.get()
+            inner_method_call = await self._next_call_queue.get()
             start_time = current_time()
             next_method, params = inner_method_call
             event = params["event"]
@@ -369,7 +375,7 @@ class ProcessingServer:
         new_params["event"] = next_event
         new_params["priority"] = priority
         new_params["timeout"] = timeout
-        await self.next_call_queue.put((method, new_params))
+        await self._next_call_queue.put((method, new_params))
         self.logger.info(
             "Method '%s' going to call next method '%s' with event id '%s'",
             prev_method,
@@ -509,6 +515,8 @@ class ProcessingServer:
         return result
 
     def run(self):
+        """Run server.
+        """
         self.debug = debug = env_var_bool("DEBUG")
         api = self.api_class(self.logger, self.state, self.call_rpc)
 

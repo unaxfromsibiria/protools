@@ -241,6 +241,5 @@ def setup_logger(
         )
 
 
-
 if env_var_bool("IMPORT_LOGGER_SETUP"):
     setup_logger()
