@@ -140,6 +140,7 @@ class ProcessingServer:
     methods = None
     free_workers = None
     state = None
+    next_call_queue = None
 
     def __init__(self, logger: object):
         self.options = {
@@ -156,14 +157,24 @@ class ProcessingServer:
                 continue
             del self.options[field]
 
-        self.state = {"active": True}
+        self.state = {
+            "active": True,
+            "stat": {
+                "call": 0,
+                "inner_call": 0,
+                "errors": 0,
+                "input": 0.0,
+            },
+        }
         self.logger = logger
         self.web_app = web.Application()
         self.workers = defaultdict(int)
         self.methods = defaultdict(list)
         self.free_workers = defaultdict(int)
         self.wait_free_timeout = env_var_float("METHOD_WAIT_TIME") or 5.0
-        self.iter_delay = env_var_float("DEFAULT_ITER_DELAY") or 0.05
+        self.iter_delay = env_var_float("DEFAULT_ITER_DELAY") or 0.025
+        self.support_iter_delay = env_var_float("SUPPORT_ITER_DELAY") or 10.0
+        self.next_call_queue = asyncio.Queue()
 
     def __str__(self) -> str:
         options = ",".join(
@@ -175,10 +186,41 @@ class ProcessingServer:
     def __repr__(self) -> str:
         return self.__str__()
 
+    @property
+    def statistic(self) -> str:
+        return ", ".join(
+            f"{key} = {val}"
+            for key, val in self.state["stat"].items()
+        )
+
     async def manage(self):
+        """Coroutine with support processing.
+        """
+        delay = self.support_iter_delay
+        if delay <= 0:
+            delay = 10.0
+            self.logger.warning("Support delay incorrect. Set to: %f", delay)
+
+        start_time = current_time()
         while self.state.get("active"):
-            # TODO: run "next" methods for multistage processing
-            await asyncio.sleep(self.iter_delay)
+            prev_call_count = self.state["stat"]["call"]
+            await asyncio.sleep(delay)
+            d_count = self.state["stat"]["call"] - prev_call_count
+            if d_count > 0:
+                # input stream (speed)
+                input_stream = d_count / delay
+            else:
+                input_stream = 0.0
+
+            prev_input = self.state["stat"]["input"]
+            self.state["stat"]["input"] = (input_stream + prev_input) / 2
+
+            if self.debug:
+                # show inner statistic
+                self.logger.debug(
+                    "Current input stream",
+                    extra={"count": input_stream, "start_time": start_time}
+                )
 
         self.logger.info("Stopping manager..")
 
@@ -246,12 +288,50 @@ class ProcessingServer:
             self.client = rpc
             await rpc.register("reg_worker", self.reg_worker, auto_delete=True)
             await rpc.register("stop", self.stop_server, auto_delete=True)
-
-            while self.state.get("active"):
-                # TODO: run "next" methods for multistage processing
-                await asyncio.sleep(self.iter_delay)
+            await self.wait_inner_call()
 
         self.logger.info("Broker processing spopping")
+
+    async def wait_inner_call(self):
+        """Polling of queue for next method call.
+        """
+        while self.state.get("active"):
+            inner_method_call = await self.next_call_queue.get()
+            start_time = current_time()
+            next_method, params = inner_method_call
+            event = params["event"]
+            try:
+                result = await self.call_rpc(next_method, params)
+            except Exception as err:
+                self.logger.error(
+                    "Next method '%s' error: %s",
+                    next_method,
+                    err,
+                    extra={
+                        "event": event,
+                        "start_time": start_time,
+                        "sys": f"{SYSTEM_NAME}.call-method-next",
+                    }
+                )
+                self.state["stat"]["errors"] += 1
+            else:
+                self.state["stat"]["call_next"] += 1
+                if self.debug:
+                    try:
+                        info = f"result: {result}"
+                    except (ValueError, TypeError):
+                        info = f"result size {len(result)}"
+
+                    self.logger.debug(
+                        "Next method '%s' %s",
+                        next_method,
+                        info,
+                        extra={
+                            "event": event,
+                            "start_time": start_time,
+                            "sys": f"{SYSTEM_NAME}.call-method-next",
+                        }
+                    )
 
     def advanced_handlers(self) -> list:
         """Other handlers.
@@ -268,8 +348,45 @@ class ProcessingServer:
 
         return ""
 
+    async def next_method_call_reg(
+            self,
+            method: str,
+            prev_result: dict,
+            prev_method: str,
+            prev_event: str,
+            priority: int,
+            timeout: float) -> dict:
+        """Registration of next calling for current methods results.
+        """
+        next_event = get_time_uuid().hex
+        new_params = {
+            res_field: res_val
+            for res_field, res_val in prev_result.items()
+            if res_field not in (
+                "event", "priority", "timeout", "next_call",
+            )
+        }
+        new_params["event"] = next_event
+        new_params["priority"] = priority
+        new_params["timeout"] = timeout
+        await self.next_call_queue.put((method, new_params))
+        self.logger.info(
+            "Method '%s' going to call next method '%s' with event id '%s'",
+            prev_method,
+            method,
+            next_event,
+            extra={
+                "event": prev_event,
+                "sys": f"{SYSTEM_NAME}.call-method-next",
+            }
+        )
+        return {"next_event": next_event}
+
     async def call_rpc(
-            self, method: str, params: dict, request: web.Request) -> dict:
+            self,
+            method: str,
+            params: dict,
+            request: web.Request = None) -> dict:
         """Access to client connection.
         """
         if self.debug:
@@ -278,14 +395,16 @@ class ProcessingServer:
         priority = int(params.get("priority") or self.default_priority)
         timeout = float(params.get("timeout") or self.wait_free_timeout)
         event = UUID(params["event"])
+        self.state["stat"]["call"] += 1
+        if request is None:
+            self.state["stat"]["inner_call"] += 1
 
         wait = True
-        exec_time = 0
+        out_client = None
+        exec_time = try_count = 0
         start_time = current_time()
         result = {}
-        try_count = 0
         context = {}
-        out_client = None
 
         while wait:
             out_client = None
@@ -300,9 +419,14 @@ class ProcessingServer:
                     try:
                         result = await self.client.call(
                             f"{method}__{client}",
-                            kwargs=result,
+                            kwargs=params,
                             priority=priority
                         )
+                        if not isinstance(result, dict):
+                            raise TypeError(
+                                f"Incorrect result type {result.__class__}"
+                            )
+
                     except DeliveryError as err:
                         wait = True
                         out_client = client
@@ -319,6 +443,7 @@ class ProcessingServer:
                                 "sys": f"{SYSTEM_NAME}.call-method"
                             }
                         )
+                        self.state["stat"]["errors"] += 1
                     else:
                         wait = False
                     finally:
@@ -327,6 +452,14 @@ class ProcessingServer:
             if wait:
                 await asyncio.sleep(self.iter_delay)
                 exec_time = current_time() - start_time
+            else:
+                # result ok
+                # next async step
+                next_call = result.get("next_call")
+                if next_call and isinstance(next_call, str):
+                    result = await self.next_method_call_reg(
+                        next_call, result, method, event, priority, timeout
+                    )
 
             if wait and exec_time > timeout:
                 wait = False
@@ -360,17 +493,18 @@ class ProcessingServer:
                             "sys": f"{SYSTEM_NAME}.call-method"
                         }
                     )
-
-                self.logger.warning(
-                    "Client '%s' for method '%s' is not available.",
-                    client,
-                    method,
-                    extra={
-                        "event": event,
-                        "start_time": start_time,
-                        "sys": f"{SYSTEM_NAME}.call-method"
-                    }
-                )
+                    self.state["stat"]["errors"] += 1
+                else:
+                    self.logger.warning(
+                        "Client '%s' for method '%s' is not available.",
+                        client,
+                        method,
+                        extra={
+                            "event": event,
+                            "start_time": start_time,
+                            "sys": f"{SYSTEM_NAME}.call-method"
+                        }
+                    )
 
         return result
 

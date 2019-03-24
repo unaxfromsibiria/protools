@@ -49,3 +49,4 @@ def run_forever():
         loop.run_until_complete(server.broker_connection.close())
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
+        logger.info("Server statistic %s", server.statistic)
