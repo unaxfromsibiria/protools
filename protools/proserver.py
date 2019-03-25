@@ -235,7 +235,7 @@ class ProcessingServer:
         Return result as dict {"ok": True} or (error as field in result)
         """
         try:
-            client_id = UUID(client)
+            client_id = UUID(client).hex
         except Exception as err:
             return {"error": f"Incorrect client id value: {err}"}
 
@@ -254,7 +254,7 @@ class ProcessingServer:
             self.logger.info(
                 "New method '%s' in client '%s' (capacity: %d).",
                 method,
-                client_id.hex,
+                client_id,
                 workers,
                 extra={
                     "sys": f"{SYSTEM_NAME}.reg-worker",
@@ -321,7 +321,7 @@ class ProcessingServer:
                 )
                 self.state["stat"]["errors"] += 1
             else:
-                self.state["stat"]["call_next"] += 1
+                self.state["stat"]["inner_call"] += 1
                 if self.debug:
                     try:
                         info = f"result: {result}"
@@ -347,7 +347,7 @@ class ProcessingServer:
     def select_client(self, method: str, context: dict) -> str:
         """Select random client.
         """
-        clients = self.workers.get(method)
+        clients = self.methods.get(method)
         if clients:
             client = random.choice(clients)
             return client
@@ -466,6 +466,8 @@ class ProcessingServer:
                     result = await self.next_method_call_reg(
                         next_call, result, method, event, priority, timeout
                     )
+                # current worker
+                result["worker"] = client
 
             if wait and exec_time > timeout:
                 wait = False

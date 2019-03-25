@@ -96,10 +96,10 @@ class BaseProcessingWorker:
                 result = {"error": "no result"}
 
             if self.next_step:
-                if issubclass(self.next_step, BaseProcessingWorker):
-                    result["next_call"] = self.next_step.name
-                elif issubclass(self.next_step, str):
+                if isinstance(self.next_step, str):
                     result["next_call"] = self.next_step
+                elif issubclass(self.next_step, BaseProcessingWorker):
+                    result["next_call"] = self.next_step.name
                 else:
                     logger.warning(
                         "Next step incorrect type in %s",
@@ -190,22 +190,22 @@ class WorkerServer:
 
         connection = await connect_robust(**broker_options)
         self.broker_connection = connection
-        async with connection:
-            channel = await connection.channel()
-            rpc = await RPC.create(channel)
-            for method in self.methods:
-                await rpc.register(
-                    method.name, self.run_processing, auto_delete=True
-                )
 
-            result = await rpc.call(
-                self.reg_method_name, kwargs=self.reg_worker_params()
+        channel = await connection.channel()
+        rpc = await RPC.create(channel)
+        for method in self.methods:
+            name = f"{method.name}__{self.client}"
+            await rpc.register(
+                name, method.run_processing, auto_delete=True
             )
-            if result and isinstance(result, dict):
-                error = result.get("error")
-                if error:
-                    self.logger.error(
-                        "Server can't registrate methods: %s", error
-                    )
+            self.logger.info("Worker method '%s' active.", name)
 
-        # TODO: launch loop
+        result = await rpc.call(
+            self.reg_method_name, kwargs=self.reg_worker_params()
+        )
+        if result and isinstance(result, dict):
+            error = result.get("error")
+            if error:
+                self.logger.error(
+                    "Server can't registrate methods: %s", error
+                )
