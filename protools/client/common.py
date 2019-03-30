@@ -11,13 +11,16 @@ from protools.helpers import env_var_line
 from protools.helpers import path_to_obj
 from protools.logs import DEFAULT_LOGGER_NAME
 from protools.logs import SYSTEM_NAME
+from protools.options import AUTH_METHOD_NAME
 from protools.options import REG_METHOD_NAME
+from protools.options import WorkerOptionEnum
 from protools.options import service_state
 
 
 class BaseProcessingWorker:
     """Base worker class.
     """
+    options_enum = WorkerOptionEnum
     client = None
     logger = None
     debug = False
@@ -25,12 +28,33 @@ class BaseProcessingWorker:
     name = None
     next_step = None
 
+    options = None
+    # registration options has format:
+    # 1) as list
+    # options = [
+    #   WorkerOptionEnum.REDIS_TRANSPORT,
+    #   WorkerOptionEnum.AUTH,
+    # ]
+    # this mean:
+    # options = {
+    #   WorkerOptionEnum.REDIS_TRANSPORT: True,
+    #   WorkerOptionEnum.AUTH: True,
+    # }
+    # 2) as dict
+    # options = {
+    #   WorkerOptionEnum.REDIS_TRANSPORT: True,
+    #   WorkerOptionEnum.STOP_MESSAGE: "it is fake option name",
+    # }
+
     def __init__(self, client: str, logger: object):
         """
         """
         self.logger = logger
         self.client = client
         self.debug = env_var_bool("DEBUG")
+        if not self.name:
+            if self.options_dict.get(WorkerOptionEnum.AUTH_BACKEND.value):
+                self.name = AUTH_METHOD_NAME
 
     def __str__(self) -> str:
         if self.next_step:
@@ -45,6 +69,27 @@ class BaseProcessingWorker:
 
     def __repr__(self) -> str:
         return self.__str__()
+
+    @property
+    def options_dict(self) -> dict:
+        """Worker options for external usage.
+        """
+        result = {}
+        if isinstance(self.options, list):
+            for field in self.options:
+                if isinstance(field, str):
+                    field = self.options_enum(field)
+
+                result[field.value] = True
+
+        elif isinstance(self.options, dict):
+            for field, val in self.options.items():
+                if isinstance(field, str):
+                    field = self.options_enum(field)
+
+                result[field.value] = val
+
+        return result
 
     def processing(self, *args, **kwargs) -> dict:
         """Main method.
@@ -170,7 +215,10 @@ class WorkerServer:
         return {
             "client": self.client,
             "workers": self.capacity,
-            "methods": [method.name for method in self.methods]
+            "methods": {
+                method.name: method.options_dict
+                for method in self.methods
+            }
         }
 
     async def run(self):

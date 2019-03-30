@@ -9,6 +9,7 @@ from protools.client.common import BaseProcessingWorker
 from protools.client.common import WorkerServer
 from protools.logs import DEFAULT_LOGGER_NAME
 from protools.logs import setup_logger
+from protools.options import WorkerOptionEnum
 
 
 class WorkerCurrentTime(BaseProcessingWorker):
@@ -17,9 +18,28 @@ class WorkerCurrentTime(BaseProcessingWorker):
 
     name = "current_time"
 
+    options = [
+        WorkerOptionEnum.AUTH
+    ]
+
     def processing(self, *args, **kwargs):
         return {
             "dt": datetime.now().isoformat()
+        }
+
+
+class WorkerAuthCheck(BaseProcessingWorker):
+    """Auth all.
+    """
+
+    options = [
+        WorkerOptionEnum.AUTH_BACKEND
+    ]
+
+    def processing(self, *args, **kwargs):
+        return {
+            "ok": True,
+            "user": {"id": random.randint(100, 1000)}
         }
 
 
@@ -58,7 +78,10 @@ def run_forever():
     logger = logging.getLogger(DEFAULT_LOGGER_NAME)
     server = WorkerServer(
         methods=[
-            WorkerAvgValue, WorkerCreateVector, WorkerCurrentTime
+            WorkerAvgValue,
+            WorkerCreateVector,
+            WorkerCurrentTime,
+            WorkerAuthCheck,
         ],
         logger=logger)
 

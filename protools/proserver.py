@@ -20,8 +20,10 @@ from .helpers import env_var_int
 from .helpers import env_var_line
 from .helpers import get_time_uuid
 from .logs import SYSTEM_NAME
+from .options import AUTH_METHOD_NAME
 from .options import REG_METHOD_NAME
 from .options import STOP_METHOD_NAME
+from .options import WorkerOptionEnum
 
 
 class ApiHandler:
@@ -92,8 +94,11 @@ class ApiHandler:
                         else:
                             if "error" in answer:
                                 error = answer["error"]
+                                status_code = int(
+                                    answer.get("status_code") or
+                                    web.HTTPGatewayTimeout.status_code
+                                )
                                 answer = None
-                                status_code = web.HTTPGatewayTimeout.status_code  # noqa
                     else:
                         status_code = web.HTTPServiceUnavailable.status_code
                         error = "Server switched to inactive status."
@@ -136,9 +141,12 @@ class ProcessingServer:
     api_class = ApiHandler
     workers = None
     methods = None
+    methods_options = None
+    methods_options_enum = WorkerOptionEnum
     free_workers = None
     state = None
     _next_call_queue = None
+    auth_method_name = AUTH_METHOD_NAME
 
     def __init__(self, logger: object):
         self.options = {
@@ -168,6 +176,7 @@ class ProcessingServer:
         self.web_app = web.Application()
         self.workers = defaultdict(int)
         self.methods = defaultdict(list)
+        self.methods_options = defaultdict(dict)
         self.free_workers = defaultdict(int)
         self.wait_free_timeout = env_var_float("METHOD_WAIT_TIME") or 5.0
         self.iter_delay = env_var_float("DEFAULT_ITER_DELAY") or 0.025
@@ -230,7 +239,7 @@ class ProcessingServer:
         self.state["active"] = False
 
     async def reg_worker(
-            self, methods: Iterable, client: str, workers: int) -> dict:
+            self, methods: dict, client: str, workers: int) -> dict:
         """New worker registration method.
         Return result as dict {"ok": True} or (error as field in result)
         """
@@ -242,25 +251,49 @@ class ProcessingServer:
         if workers < 1:
             return {"error": "Incorrect worker value."}
 
-        methods_names = set()
+        methods_names = {}
         for method in methods:
             if method and isinstance(method, str):
-                methods_names.add(method)
+                methods_names[method] = methods[method]
 
         if not methods_names:
-            return {"error": "Empty methods list."}
+            return {"error": "Empty methods set."}
+        if not isinstance(methods_names, dict):
+            return {"error": "Workers methods format incorrect."}
 
-        for method in methods_names:
+        for method, options in methods_names.items():
+            actual_options = {}
+            for opt, opt_val in options.items():
+                try:
+                    enum_opt = self.methods_options_enum(opt)
+                except (ValueError, KeyError, TypeError):
+                    return {"error": f"Unknow options '{opt}'."}
+                else:
+                    actual_options[enum_opt] = opt_val
+
+            if actual_options.get(WorkerOptionEnum.AUTH_BACKEND):
+                # repalce method name
+                method = self.auth_method_name
+                actual_options[WorkerOptionEnum.USE_HEADERS] = True
+                if WorkerOptionEnum.AUTH in actual_options:
+                    # no auth for method of
+                    del actual_options[WorkerOptionEnum.AUTH]
+
             self.logger.info(
-                "New method '%s' in client '%s' (capacity: %d).",
+                (
+                    "New method '%s' in client '%s' (capacity: %d) "
+                    "set options to: %s."
+                ),
                 method,
                 client_id,
                 workers,
+                options,
                 extra={
                     "sys": f"{SYSTEM_NAME}.reg-worker",
                 }
             )
             self.methods[method].append(client_id)
+            self.methods_options[method] = actual_options
 
         self.free_workers[client_id] += workers
         self.workers[client_id] += workers
@@ -354,6 +387,13 @@ class ProcessingServer:
 
         return ""
 
+    async def auth_check(self, params: dict, request: web.Request) -> dict:
+        """Main auth method.
+        """
+        # TODO: using auth backend and cache
+        user_data = await self.call_rpc(self.auth_method_name, params, request)
+        return user_data.get("user")
+
     async def next_method_call_reg(
             self,
             method: str,
@@ -415,6 +455,21 @@ class ProcessingServer:
         while wait:
             out_client = None
             try_count += 1
+            # method options check
+            options = self.methods_options.get(method)
+            if options.get(WorkerOptionEnum.USE_HEADERS):
+                params["headers"] = dict(request._message.headers)
+
+            if options.get(WorkerOptionEnum.AUTH):
+                auth_result = await self.auth_check(params, request)
+                if not auth_result:
+                    wait = False
+                    result = {
+                        "error": "Access denied.",
+                        "status_code": web.HTTPUnauthorized.status_code,
+                    }
+                    break
+
             # select and call
             client = self.select_client(method, context)
             if client:
