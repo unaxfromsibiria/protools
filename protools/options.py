@@ -9,6 +9,7 @@ service_state = {
 REG_METHOD_NAME = "reg_worker"
 STOP_METHOD_NAME = "stop_server"
 AUTH_METHOD_NAME = "exec_auth"
+METHOD_RESULT_KEY = "result_key"
 
 
 @unique

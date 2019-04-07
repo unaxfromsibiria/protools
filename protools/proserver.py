@@ -6,6 +6,7 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from uuid import UUID
 
+import aioredis
 from aio_pika import connect_robust
 from aio_pika.patterns import RPC
 from aiohttp import web
@@ -18,9 +19,11 @@ from .helpers import env_var_bool
 from .helpers import env_var_float
 from .helpers import env_var_int
 from .helpers import env_var_line
+from .helpers import env_var_list
 from .helpers import get_time_uuid
 from .logs import SYSTEM_NAME
 from .options import AUTH_METHOD_NAME
+from .options import METHOD_RESULT_KEY
 from .options import REG_METHOD_NAME
 from .options import STOP_METHOD_NAME
 from .options import WorkerOptionEnum
@@ -134,10 +137,12 @@ class ProcessingServer:
     """Processing server.
     """
     debug = False
+    redis_transport = True
     default_priority = 5
     shutdown_timeout = 0.5
     options = logger = None
     web_app = None
+    redis_pool = None
     api_class = ApiHandler
     workers = None
     methods = None
@@ -149,6 +154,21 @@ class ProcessingServer:
     auth_method_name = AUTH_METHOD_NAME
 
     def __init__(self, logger: object):
+        self.logger = logger
+        self.web_app = web.Application()
+        self.workers = defaultdict(int)
+        self.methods = defaultdict(list)
+        self.methods_options = defaultdict(dict)
+        self.free_workers = defaultdict(int)
+        self.wait_free_timeout = env_var_float("METHOD_WAIT_TIME") or 5.0
+        self.iter_delay = env_var_float("DEFAULT_ITER_DELAY") or 0.025
+        self.support_iter_delay = env_var_float("SUPPORT_ITER_DELAY") or 10.0
+        self._next_call_queue = asyncio.Queue()
+
+        redis_address = tuple(env_var_list("REDIS_ADDRES"))
+        if len(redis_address) == 1:
+            redis_address, *_ = redis_address
+
         self.options = {
             "port": env_var_int("HTTP_PORT"),
             "host": env_var_line("HTTP_HOST"),
@@ -157,7 +177,16 @@ class ProcessingServer:
             "broker_login": env_var_line("BROKER_LOGIN"),
             "broker_password": env_var_line("BROKER_PASSWORD"),
             "broker_virtualhost": env_var_line("BROKER_VIRTUALHOST"),
+            "redis_address": redis_address,
+            "redis_db": env_var_int("REDIS_DB"),
+            "redis_pool_size": env_var_int("REDIS_POOL_SIZE") or 10,
+            "redis_default_timeout": (
+                env_var_int("REDIS_DEFAULT_TIMEOUT") or self.wait_free_timeout
+            ),
+            "redis_data_transport": env_var_bool("REDIS_DATA_TRANSPORT") or True,
         }
+        self.redis_transport = self.options.get("redis_data_transport")
+
         for field in list(self.options.keys()):
             if self.options.get(field):
                 continue
@@ -172,16 +201,6 @@ class ProcessingServer:
                 "input": 0.0,
             },
         }
-        self.logger = logger
-        self.web_app = web.Application()
-        self.workers = defaultdict(int)
-        self.methods = defaultdict(list)
-        self.methods_options = defaultdict(dict)
-        self.free_workers = defaultdict(int)
-        self.wait_free_timeout = env_var_float("METHOD_WAIT_TIME") or 5.0
-        self.iter_delay = env_var_float("DEFAULT_ITER_DELAY") or 0.025
-        self.support_iter_delay = env_var_float("SUPPORT_ITER_DELAY") or 10.0
-        self._next_call_queue = asyncio.Queue()
 
     def __str__(self) -> str:
         options = ",".join(
@@ -199,6 +218,21 @@ class ProcessingServer:
             f"{key} = {val}"
             for key, val in self.state["stat"].items()
         )
+
+    def cache_params_key(self, event: UUID) -> str:
+        """Create cache key.
+        """
+        return f"proserver:params:{event.hex}"
+
+    def cache_params_to_value(self, params: dict) -> str:
+        """Return data as string to record in cache.
+        """
+        return ujson.dumps(params)
+
+    def cache_value_to_params(self, data: str) -> dict:
+        """Return data as string to record in cache.
+        """
+        return ujson.loads(data)
 
     async def manage(self):
         """Coroutine with support processing.
@@ -299,7 +333,7 @@ class ProcessingServer:
         self.workers[client_id] += workers
         return {"ok": True}
 
-    async def broker_handler(self):
+    async def connection_handler(self):
         """
         """
         fields = (
@@ -316,6 +350,12 @@ class ProcessingServer:
                 options[field] = value
 
         self.broker_connection = connection = await connect_robust(**options)
+
+        self.redis_pool = await aioredis.create_redis_pool(
+            address=self.options.get("redis_address"),
+            db=self.options.get("redis_db"),
+            maxsize=self.options.get("redis_pool_size"),
+        )
 
         async with connection:
             channel = await connection.channel()
@@ -451,14 +491,23 @@ class ProcessingServer:
         start_time = current_time()
         result = {}
         context = {}
+        options = self.methods_options.get(method)
+        if options.get(WorkerOptionEnum.USE_HEADERS):
+            params["headers"] = dict(request._message.headers)
+
+        redis_transport = self.redis_transport
+        if redis_transport:
+            method_params = {"event": event.hex}
+            cache_value = self.cache_params_to_value(params)
+        else:
+            # all data send to broker
+            method_params = params
+            cache_value = None
 
         while wait:
             out_client = None
             try_count += 1
             # method options check
-            options = self.methods_options.get(method)
-            if options.get(WorkerOptionEnum.USE_HEADERS):
-                params["headers"] = dict(request._message.headers)
 
             if options.get(WorkerOptionEnum.AUTH):
                 auth_result = await self.auth_check(params, request)
@@ -478,15 +527,36 @@ class ProcessingServer:
                 if free > 0:
                     self.free_workers[client] -= 1
                     try:
+                        # send data to cache
+                        if redis_transport:
+                            await self.redis_pool.set(
+                                key=self.cache_params_key(event),
+                                value=cache_value,
+                                expire=timeout
+                            )
+
+                        # call rpc client
                         result = await self.client.call(
                             f"{method}__{client}",
-                            kwargs=params,
+                            kwargs=method_params,
                             priority=priority
                         )
                         if not isinstance(result, dict):
                             raise TypeError(
                                 f"Incorrect result type {result.__class__}"
                             )
+                        if redis_transport:
+                            result_cache_key = result.get(METHOD_RESULT_KEY)
+                            if (
+                                    result_cache_key and
+                                    isinstance(result_cache_key, str)):
+                                result = await self.redis_pool.get(
+                                    result_cache_key
+                                )
+                                if not isinstance(result, dict):
+                                    raise TypeError(f"Incorrect result in cache by key '{result_cache_key}'")  # noqa
+                            else:
+                                raise ValueError(f"Expected result in cache {METHOD_RESULT_KEY}")  # noqa
 
                     except DeliveryError as err:
                         wait = True
@@ -587,7 +657,7 @@ class ProcessingServer:
 
         asyncio.gather(
             self.manage(),
-            self.broker_handler(),
+            self.connection_handler(),
             web._run_app(
                 self.web_app,
                 port=self.options.get("port"),

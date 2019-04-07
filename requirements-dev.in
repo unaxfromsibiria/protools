@@ -1,6 +1,9 @@
+
 ipython
 ipdb
 pytest
 pytest-cov
 pytest-sugar
 pytest-aiohttp
+pip-tools
+# cp requirements-common.in requirements.in && pip-compile -P requirements.in && rm requirements.in
