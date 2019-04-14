@@ -165,7 +165,7 @@ class ProcessingServer:
         self.support_iter_delay = env_var_float("SUPPORT_ITER_DELAY") or 10.0
         self._next_call_queue = asyncio.Queue()
 
-        redis_address = tuple(env_var_list("REDIS_ADDRES"))
+        redis_address = tuple(env_var_list("REDIS_ADDRESS"))
         if len(redis_address) == 1:
             redis_address, *_ = redis_address
 
@@ -183,7 +183,9 @@ class ProcessingServer:
             "redis_default_timeout": (
                 env_var_int("REDIS_DEFAULT_TIMEOUT") or self.wait_free_timeout
             ),
-            "redis_data_transport": env_var_bool("REDIS_DATA_TRANSPORT") or True,
+            "redis_data_transport": not env_var_bool(
+                "REDIS_DATA_TRANSPORT_OFF"
+                ),
         }
         self.redis_transport = self.options.get("redis_data_transport")
 
@@ -532,7 +534,7 @@ class ProcessingServer:
                             await self.redis_pool.set(
                                 key=self.cache_params_key(event),
                                 value=cache_value,
-                                expire=timeout
+                                expire=int(timeout)
                             )
 
                         # call rpc client
