@@ -14,6 +14,7 @@ from aiormq.exceptions import DeliveryError
 
 import ujson
 
+from .helpers import CacheValueManager
 from .helpers import current_time
 from .helpers import env_var_bool
 from .helpers import env_var_float
@@ -148,9 +149,12 @@ class ProcessingServer:
     methods = None
     methods_options = None
     methods_options_enum = WorkerOptionEnum
+    cache_value_manager_cls = CacheValueManager
     free_workers = None
     state = None
     _next_call_queue = None
+    _cache_value_manager = None
+
     auth_method_name = AUTH_METHOD_NAME
 
     def __init__(self, logger: object):
@@ -164,6 +168,7 @@ class ProcessingServer:
         self.iter_delay = env_var_float("DEFAULT_ITER_DELAY") or 0.025
         self.support_iter_delay = env_var_float("SUPPORT_ITER_DELAY") or 10.0
         self._next_call_queue = asyncio.Queue()
+        self._cache_value_manager = self.cache_value_manager_cls()
 
         redis_address = tuple(env_var_list("REDIS_ADDRESS"))
         if len(redis_address) == 1:
@@ -185,7 +190,7 @@ class ProcessingServer:
             ),
             "redis_data_transport": not env_var_bool(
                 "REDIS_DATA_TRANSPORT_OFF"
-                ),
+            ),
         }
         self.redis_transport = self.options.get("redis_data_transport")
 
@@ -220,21 +225,6 @@ class ProcessingServer:
             f"{key} = {val}"
             for key, val in self.state["stat"].items()
         )
-
-    def cache_params_key(self, event: UUID) -> str:
-        """Create cache key.
-        """
-        return f"proserver:params:{event.hex}"
-
-    def cache_params_to_value(self, params: dict) -> str:
-        """Return data as string to record in cache.
-        """
-        return ujson.dumps(params)
-
-    def cache_value_to_params(self, data: str) -> dict:
-        """Return data as string to record in cache.
-        """
-        return ujson.loads(data)
 
     async def manage(self):
         """Coroutine with support processing.
@@ -353,11 +343,12 @@ class ProcessingServer:
 
         self.broker_connection = connection = await connect_robust(**options)
 
-        self.redis_pool = await aioredis.create_redis_pool(
-            address=self.options.get("redis_address"),
-            db=self.options.get("redis_db"),
-            maxsize=self.options.get("redis_pool_size"),
-        )
+        if self.redis_transport:
+            self.redis_pool = await aioredis.create_redis_pool(
+                address=self.options.get("redis_address"),
+                db=self.options.get("redis_db"),
+                maxsize=self.options.get("redis_pool_size"),
+            )
 
         async with connection:
             channel = await connection.channel()
@@ -500,7 +491,9 @@ class ProcessingServer:
         redis_transport = self.redis_transport
         if redis_transport:
             method_params = {"event": event.hex}
-            cache_value = self.cache_params_to_value(params)
+            cache_value = self._cache_value_manager.params_to_value(
+                params
+            )
         else:
             # all data send to broker
             method_params = params
@@ -532,7 +525,9 @@ class ProcessingServer:
                         # send data to cache
                         if redis_transport:
                             await self.redis_pool.set(
-                                key=self.cache_params_key(event),
+                                key=self._cache_value_manager.params_key(
+                                    event
+                                ),
                                 value=cache_value,
                                 expire=int(timeout)
                             )

@@ -4,6 +4,9 @@ import random
 import sys
 import traceback
 import uuid
+from uuid import UUID
+
+import ujson
 
 from .options import service_state
 
@@ -140,3 +143,29 @@ def env_var_list(key: str) -> list:
             None, map(str.strip, env_var_line(key).split(","))
         )
     )
+
+
+class CacheValueManager:
+    """Common cache manager.
+    """
+
+    def params_key(self, event: UUID) -> str:
+        """Create cache key.
+        """
+        return f"proserver:params:{event.hex}"
+
+    def params_to_value(self, params: dict) -> str:
+        """Return data as string to record in cache.
+        """
+        return ujson.dumps(params)
+
+    def value_to_params(self, data: str) -> dict:
+        """Return data as string to record in cache.
+        """
+        return ujson.loads(data)
+
+    def result_key(self, event: UUID) -> str:
+        """Result of methods new key.
+        """
+        r_part = uuid.uuid4().hex[:8]
+        return f"proserver:result:{event.hex}:{r_part}"
