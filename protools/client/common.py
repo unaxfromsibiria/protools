@@ -8,6 +8,7 @@ from aio_pika.patterns import RPC
 from protools.helpers import CacheValueManager
 from protools.helpers import current_time
 from protools.helpers import env_var_bool
+from protools.helpers import env_var_float
 from protools.helpers import env_var_int
 from protools.helpers import env_var_line
 from protools.helpers import env_var_list
@@ -140,7 +141,7 @@ class BaseProcessingWorker:
             return result
 
         try:
-            result = self.processing(**params)
+            result = self.processing(**call_params)
         except Exception as err:
             logger.critical(
                 "In method '%s' error: %s",
@@ -212,6 +213,7 @@ class WorkerServer:
     use_redis_connection = True
 
     reg_method_name = REG_METHOD_NAME
+    default_cache_timeout = 5.0
 
     def __init__(self, methods: list, capacity: int = 0, logger=None):
         """
@@ -289,9 +291,14 @@ class WorkerServer:
             redis_address, *_ = redis_address
 
         redis_transport = not env_var_bool("REDIS_DATA_TRANSPORT_OFF")
-        redis_timeout = env_var_int("REDIS_DEFAULT_TIMEOUT")
+        redis_timeout = (
+            env_var_float("REDIS_DEFAULT_TIMEOUT") or
+            env_var_float("METHOD_WAIT_TIME") or
+            self.default_cache_timeout
+        )
 
-        if self.redis_transport or self.use_redis_connection:
+        if redis_transport or self.use_redis_connection:
+            assert redis_address, "Redis configuration exprcted."
             redis_pool = await aioredis.create_redis_pool(
                 address=redis_address,
                 db=env_var_int("REDIS_DB") or 0,

@@ -95,6 +95,7 @@ class ApiHandler:
                         except Exception as err:
                             status_code = web.HTTPInternalServerError.status_code  # noqa
                             error = f"{err}"
+                            self.logger.critical(err)
                         else:
                             if "error" in answer:
                                 error = answer["error"]
@@ -485,7 +486,7 @@ class ProcessingServer:
         result = {}
         context = {}
         options = self.methods_options.get(method)
-        if options.get(WorkerOptionEnum.USE_HEADERS):
+        if options and options.get(WorkerOptionEnum.USE_HEADERS):
             params["headers"] = dict(request._message.headers)
 
         redis_transport = self.redis_transport
@@ -504,7 +505,7 @@ class ProcessingServer:
             try_count += 1
             # method options check
 
-            if options.get(WorkerOptionEnum.AUTH):
+            if options and options.get(WorkerOptionEnum.AUTH):
                 auth_result = await self.auth_check(params, request)
                 if not auth_result:
                     wait = False
@@ -524,12 +525,14 @@ class ProcessingServer:
                     try:
                         # send data to cache
                         if redis_transport:
+                            key = self._cache_value_manager.params_key(event)
                             await self.redis_pool.set(
-                                key=self._cache_value_manager.params_key(
-                                    event
-                                ),
-                                value=cache_value,
-                                expire=int(timeout)
+                                key=key, value=cache_value, expire=int(timeout)
+                            )
+                            self.logger.debug(
+                                "Data in cache: %s",
+                                key,
+                                extra={"count": len(cache_value)}
                             )
 
                         # call rpc client
@@ -550,6 +553,8 @@ class ProcessingServer:
                                 result = await self.redis_pool.get(
                                     result_cache_key
                                 )
+                                if result:
+                                    result = self._cache_value_manager.value_to_params(result)  # noqa
                                 if not isinstance(result, dict):
                                     raise TypeError(f"Incorrect result in cache by key '{result_cache_key}'")  # noqa
                             else:

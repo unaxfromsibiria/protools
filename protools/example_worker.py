@@ -4,12 +4,16 @@ import random
 from datetime import datetime
 
 import uvloop
+from dotenv import load_dotenv
 
 from protools.client.common import BaseProcessingWorker
 from protools.client.common import WorkerServer
+from protools.helpers import env_var_line
 from protools.logs import DEFAULT_LOGGER_NAME
 from protools.logs import setup_logger
 from protools.options import WorkerOptionEnum
+
+load_dotenv(env_var_line("ENV_FILE") or "service.env")
 
 
 class WorkerCurrentTime(BaseProcessingWorker):
