@@ -1,3 +1,4 @@
 aiohttp
 aio-pika
 aioredis
+pyjwt

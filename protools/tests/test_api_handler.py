@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import uuid
+import jwt
 from unittest import mock
 
 import pytest
@@ -9,6 +10,8 @@ from aiohttp.test_utils import make_mocked_request
 
 from protools.logs import setup_logger
 from protools.proserver import ApiHandler
+from protools.jwt_common import JwtApiHandeler
+from protools.options import WorkerOptionEnum
 
 
 def get_logger() -> (object, io.StringIO):
@@ -30,7 +33,11 @@ async def test_empty_requst():
     async def call_intest(method, params, request):
         return {}
 
-    api = ApiHandler(logger, state, call_intest)
+    async def method_opts(method: str):
+        assert method
+        return {WorkerOptionEnum.AUTH: False}
+
+    api = ApiHandler(logger, state, call_intest, method_opts)
     req = make_mocked_request("POST", "/api", )
 
     async def json_data(*args, **kwargs):
@@ -57,7 +64,11 @@ async def test_empty_with_hexid_requst():
     async def call_intest(method, params, request):
         return {"method": []}
 
-    api = ApiHandler(logger, state, call_intest)
+    async def method_opts(method: str):
+        assert method
+        return {WorkerOptionEnum.AUTH: False}
+
+    api = ApiHandler(logger, state, call_intest, method_opts)
     api.id_as_int = False
     req = make_mocked_request("POST", "/api", )
     id_value = uuid.uuid4().hex
@@ -88,7 +99,11 @@ async def test_empty_with_intid_requst():
     async def call_intest(method, params, request):
         return {}
 
-    api = ApiHandler(logger, state, call_intest)
+    async def method_opts(method: str):
+        assert method
+        return {WorkerOptionEnum.AUTH: False}
+
+    api = ApiHandler(logger, state, call_intest, method_opts)
     api.id_as_int = True
     req = make_mocked_request("POST", "/api", )
     id_value = int(uuid.uuid4().hex[:8], 16)
@@ -118,7 +133,11 @@ async def test_empty_with_bad_id_requst():
     async def call_intest(method, params, request):
         return {}
 
-    api = ApiHandler(logger, state, call_intest)
+    async def method_opts(method: str):
+        assert method
+        return {WorkerOptionEnum.AUTH: False}
+
+    api = ApiHandler(logger, state, call_intest, method_opts)
     api.id_as_int = True
     req = make_mocked_request("POST", "/api", )
     id_value = "bad_uuid"
@@ -154,7 +173,11 @@ async def test_bad_method_params_requst():
     async def call_intest(method, params, request):
         return {}
 
-    api = ApiHandler(logger, state, call_intest)
+    async def method_opts(method: str):
+        assert method
+        return {WorkerOptionEnum.AUTH: False}
+
+    api = ApiHandler(logger, state, call_intest, method_opts)
     api.id_as_int = True
     req = make_mocked_request("POST", "/api", )
     id_value = uuid.uuid4().int
@@ -172,3 +195,62 @@ async def test_bad_method_params_requst():
     assert data.get("id") == id_value
     error = data.get("error")
     assert error.get("code") == 400
+
+
+@pytest.mark.asyncio
+async def test_jwt_correcttoken_method_params_format():
+    """Check correct format of params hidden by jwt method.
+    """
+    logger, buffer = get_logger()
+    state = {"active": True}
+    user_id = uuid.uuid4().hex
+    token_key = uuid.uuid4().hex
+
+    async def call_intest(method, params, request):
+        if method == "get_client_token":
+            assert params.get("client") == user_id
+            return {
+                "token": token_key
+            }
+        else:
+            assert method == "test"
+            assert params.get("event")
+            assert params.get("client") == user_id
+            assert params.get("test_param") == ["test"]
+            return {"ok": True}
+
+    async def method_opts(method: str):
+        assert method
+        return {WorkerOptionEnum.AUTH: True}
+
+    api = JwtApiHandeler(logger, state, call_intest, method_opts)
+    api.id_as_int = True
+    req = make_mocked_request("POST", "/api", )
+    id_value = uuid.uuid4().int
+
+    async def json_data(*args, **kwargs):
+        return {
+            "id": id_value,
+            "method": "test",
+            "params": {
+                "data": jwt.encode(
+                    {
+                        "client": user_id,
+                        "test_param": ["test"],
+                    },
+                    token_key,
+                    algorithm="HS256"
+                )
+            }
+        }
+
+    with mock.patch("aiohttp.web.Request.json", json_data):
+        res = await api.http_handler(req)
+
+    assert res is not None
+    assert res.text
+    assert res.status == 200
+    data = json.loads(res.text)
+    assert data.get("jsonrpc") == "2.0"
+    assert data.get("id") == id_value
+    assert data.get("result") == {"ok": True}

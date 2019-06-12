@@ -38,24 +38,40 @@ class ApiHandler:
     id_as_int = True
     _server_state = None
     _rpc_call_method = None
+    _options_access_method = None
 
     def __init__(
-            self,
-            logger: object,
-            server_state: dict,
-            rpc_call: Callable):
+        self,
+        logger: object,
+        server_state: dict,
+        rpc_call: Callable,
+        options_access_method: Callable
+    ):
         """
         """
         # TODO: create brocker connection
         self.logger = logger
         self._server_state = server_state
         self._rpc_call_method = rpc_call
+        self._options_access_method = options_access_method
 
     async def call(self, method: str, params: dict, request) -> dict:
         """Select and call server method.
         """
         result = await self._rpc_call_method(method, params, request)
         return result
+
+    async def pre_processing(
+        self,
+        event: UUID,
+        method: str,
+        method_options: dict,
+        params: dict,
+        request
+    ) -> dict:
+        """Params pre processing.
+        """
+        return None
 
     async def http_handler(self, request, *args, **kwargs):
         """Parse request as json rpc request.
@@ -83,14 +99,31 @@ class ApiHandler:
         else:
             method_name = data.get("method")
             if method_name and isinstance(method_name, str):
+                # method options from server.
+                method_options = await self._options_access_method(method_name)
                 params = data.get("params") or {}
+                if isinstance(params, str):
+                    params = {"data": params}
+
                 if isinstance(params, dict):
                     if self._server_state.get("active"):
-                        params["event"] = event.hex
                         try:
-                            answer = await self.call(
-                                method_name, params, request
+                            answer = await self.pre_processing(
+                                event,
+                                method_name,
+                                method_options,
+                                params,
+                                request
                             )
+                            if isinstance(answer, dict) and "params" in answer:
+                                params = answer["params"]
+                                answer = None
+
+                            params["event"] = event.hex
+                            if not answer:
+                                answer = await self.call(
+                                    method_name, params, request
+                                )
                             assert isinstance(answer, dict), "Incorrect answer format"  # noqa
                         except Exception as err:
                             status_code = web.HTTPInternalServerError.status_code  # noqa
@@ -113,8 +146,6 @@ class ApiHandler:
             else:
                 status_code = web.HTTPBadRequest.status_code
                 error = "Incorrect JSON-RPC request (wrong name of method)"
-
-            # TODO: JWT for params? (need token auth)
 
         # TODO: big result and params save to redis (have to transfer without message broker)
 
@@ -209,6 +240,7 @@ class ProcessingServer:
                 "input": 0.0,
             },
         }
+        self.setup()
 
     def __str__(self) -> str:
         options = ",".join(
@@ -226,6 +258,11 @@ class ProcessingServer:
             f"{key} = {val}"
             for key, val in self.state["stat"].items()
         )
+
+    def setup(self):
+        """Advanced init method.
+        """
+        pass
 
     async def manage(self):
         """Coroutine with support processing.
@@ -266,7 +303,8 @@ class ProcessingServer:
         self.state["active"] = False
 
     async def reg_worker(
-            self, methods: dict, client: str, workers: int) -> dict:
+        self, methods: dict, client: str, workers: int
+    ) -> dict:
         """New worker registration method.
         Return result as dict {"ok": True} or (error as field in result)
         """
@@ -429,13 +467,14 @@ class ProcessingServer:
         return user_data.get("user")
 
     async def next_method_call_reg(
-            self,
-            method: str,
-            prev_result: dict,
-            prev_method: str,
-            prev_event: str,
-            priority: int,
-            timeout: float) -> dict:
+        self,
+        method: str,
+        prev_result: dict,
+        prev_method: str,
+        prev_event: str,
+        priority: int,
+        timeout: float
+    ) -> dict:
         """Registration of next calling for current methods results.
         """
         next_event = get_time_uuid().hex
@@ -463,10 +502,11 @@ class ProcessingServer:
         return {"next_event": next_event}
 
     async def call_rpc(
-            self,
-            method: str,
-            params: dict,
-            request: web.Request = None) -> dict:
+        self,
+        method: str,
+        params: dict,
+        request: web.Request = None
+    ) -> dict:
         """Access to client connection.
         """
         if self.debug:
@@ -643,11 +683,22 @@ class ProcessingServer:
 
         return result
 
+    async def get_method_options(self, method: str) -> dict:
+        """Read options for method.
+        """
+        options = self.methods_options.get(method)
+        if options:
+            return options
+        else:
+            return {}
+
     def run(self):
         """Run server.
         """
         self.debug = debug = env_var_bool("DEBUG")
-        api = self.api_class(self.logger, self.state, self.call_rpc)
+        api = self.api_class(
+            self.logger, self.state, self.call_rpc, self.get_method_option
+        )
 
         self.web_app.add_routes(
             [
